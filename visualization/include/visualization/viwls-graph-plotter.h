@@ -89,6 +89,14 @@ class ViwlsGraphRvizPlotter {
       const pose_graph::VertexIdList& storing_vertices,
       const visualization::Color& color,
       visualization::SphereVector* spheres) const;
+  void appendDepthPointsToSphereVector(
+      const vi_map::VIMap& map,
+      const vi_map::MissionIdList& missions,
+      visualization::SphereVector* spheres) const;
+  void appendDepthPointsToSphereVector(
+      const vi_map::VIMap& map,
+      const pose_graph::VertexIdList& storing_vertices,
+      visualization::SphereVector* spheres) const;
 
   void publishPosesInGlobalFrame(
       const aslam::TransformationVector& transformations) const;
@@ -119,6 +127,7 @@ class ViwlsGraphRvizPlotter {
   static const std::string kLoopclosureTopic;
   static const std::string kLandmarkPairsTopic;
   static const std::string kLandmarkTopic;
+  static const std::string kDepthPointsTopic;
   static const std::string kMeshTopic;
   static const std::string kLandmarkNormalsTopic;
   static const std::string kSlidingWindowLocalizationResultTopic;

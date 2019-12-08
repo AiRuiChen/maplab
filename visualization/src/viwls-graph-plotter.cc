@@ -65,6 +65,20 @@ DEFINE_double(
 DEFINE_double(
     vis_color_by_height_offset_m, 0., "The offset for coloring by height.");
 
+DEFINE_bool(
+    vis_publish_depth_points, true, "If set to true, display depth point clouds.");
+DEFINE_int32(
+    vis_depth_points_vertex_visualized_count, 5,
+    "Set the number of vertex point cloud to process.");
+DEFINE_bool(
+    vis_depth_points_from_consecutive_vertices, true,
+    "If set to true, display depth point clouds from consecutive vertices."
+    "If set to false, display evenly sampled vertices along the trajectory.");
+DEFINE_int32(
+    vis_depth_points_first_vertex_index, 0,
+    "Set the starting index of vertex to display."
+    "This flag works if FLAGS_vis_depth_points_from_consecutive_vertices is set to True.");
+
 DEFINE_double(vis_offset_x_m, 0.0, "Offset in x for RViz visualization");
 DEFINE_double(vis_offset_y_m, 0.0, "Offset in y for RViz visualization");
 DEFINE_double(vis_offset_z_m, 0.0, "Offset in z for RViz visualization");
@@ -90,7 +104,9 @@ const std::string ViwlsGraphRvizPlotter::kBoxTopic = "boxes";
 const std::string ViwlsGraphRvizPlotter::kLoopclosureTopic = "loop_closures";
 const std::string ViwlsGraphRvizPlotter::kLandmarkPairsTopic = "landmark_pairs";
 const std::string ViwlsGraphRvizPlotter::kLandmarkTopic =
-    visualization::kViMapTopicHead + "_landmarks";
+        visualization::kViMapTopicHead + "_landmarks";
+const std::string ViwlsGraphRvizPlotter::kDepthPointsTopic =
+    visualization::kViMapTopicHead + "_depth_points";
 const std::string ViwlsGraphRvizPlotter::kMeshTopic = "meshes";
 const std::string ViwlsGraphRvizPlotter::kLandmarkNormalsTopic =
     "landmark_normals";
@@ -544,6 +560,171 @@ void ViwlsGraphRvizPlotter::appendLandmarksToSphereVector(
   }
 }
 
+void ViwlsGraphRvizPlotter::appendDepthPointsToSphereVector(
+        const vi_map::VIMap &map, const vi_map::MissionIdList &missions,
+        visualization::SphereVector *spheres) const {
+    CHECK_NOTNULL(spheres);
+
+    for (const vi_map::MissionId &mission_id : missions) {
+        pose_graph::VertexIdList vertices;
+        map.getAllVertexIdsInMission(mission_id, &vertices);
+        appendDepthPointsToSphereVector(map, vertices, spheres);
+    }
+}
+
+void ViwlsGraphRvizPlotter::appendDepthPointsToSphereVector(
+        const vi_map::VIMap &map, const pose_graph::VertexIdList &storing_vertices,
+        visualization::SphereVector *spheres) const {
+    CHECK_NOTNULL(spheres);
+
+    visualization::Palette palette = visualization::GetPalette(
+        visualization::Palette::PaletteTypes::kFalseColor1);
+
+    if (storing_vertices.empty()) {
+        return;
+    }
+
+    const vi_map::MissionId &mission_id =
+            map.getVertex(*storing_vertices.begin()).getMissionId();
+    const vi_map::VIMission &mission = map.getMission(mission_id);
+    const aslam::NCamera& n_camera =
+          map.getSensorManager().getNCameraForMission(mission_id);
+    const aslam::Transformation& T_G_M =
+          map.getMissionBaseFrameForMission(mission_id).get_T_G_M();
+    const vi_map::MissionBaseFrame &baseframe =
+        map.getMissionBaseFrame(mission.getBaseFrameId());
+
+    const size_t vertex_count = storing_vertices.size();
+    LOG(INFO) << "vertex count: " << vertex_count;
+    std::vector<pose_graph::VertexId> vertices_to_show;
+
+    // Populate vertices_to_show according to display flags
+    CHECK_LE(FLAGS_vis_depth_points_vertex_visualized_count, vertex_count)
+            << "Vertex visualized count should be less than total vertex count!";
+    if (FLAGS_vis_depth_points_from_consecutive_vertices) {
+      CHECK_GE(FLAGS_vis_depth_points_first_vertex_index, 0) << "A valid index should be greater or equal to 0!";
+      CHECK_LE(FLAGS_vis_depth_points_first_vertex_index, vertex_count) << "Start index go out-of-bound!";
+      CHECK_GE(vertex_count - FLAGS_vis_depth_points_first_vertex_index,
+               FLAGS_vis_depth_points_vertex_visualized_count)
+              << "Not enough vertex to show from start index to end. Consider adjusting start index?";
+
+      LOG(INFO) << "Showing " << FLAGS_vis_depth_points_vertex_visualized_count
+                << " depth clouds from consecutive vertices starting at index"
+                << FLAGS_vis_depth_points_first_vertex_index;
+      for (int i = FLAGS_vis_depth_points_first_vertex_index;
+           i < FLAGS_vis_depth_points_first_vertex_index + FLAGS_vis_depth_points_vertex_visualized_count;
+           i++) {
+        vertices_to_show.push_back(storing_vertices[i]);
+        LOG(INFO) << "vertex id: " << i;
+      }
+    } else {
+      int skip = vertex_count / FLAGS_vis_depth_points_vertex_visualized_count;
+      LOG(INFO) << "Showing " << FLAGS_vis_depth_points_vertex_visualized_count
+                << " depth clouds from evenly distributed vertices ";
+      int index = 0;
+      for (int i = 0; i < FLAGS_vis_depth_points_vertex_visualized_count; i++) {
+        vertices_to_show.push_back(storing_vertices[index]);
+
+        // calculate distance
+        float distance = 0;
+        const int end_index = index + skip;
+        for (; index < end_index; index++) {
+          const vi_map::Vertex &vertex_from = map.getVertex(storing_vertices[index]);
+          const Eigen::Vector3d M_p_I_from = vertex_from.get_p_M_I();
+          Eigen::Vector3d from = baseframe.transformPointInMissionFrameToGlobalFrame(M_p_I_from) - origin_;
+          const vi_map::Vertex &vertex_to = map.getVertex(storing_vertices[index+1]);
+          const Eigen::Vector3d M_p_I_to = vertex_to.get_p_M_I();
+          Eigen::Vector3d to = baseframe.transformPointInMissionFrameToGlobalFrame(M_p_I_to) - origin_;
+          distance += (to-from).norm();
+        }
+        LOG(INFO) << "vertex id: " << index << " trajectory distance to next: " << distance;
+      }
+    }
+
+    visualization::PoseVector poses;
+    visualization::LineSegmentVector line_segments;
+    Eigen::Vector3d last_pose;
+    bool last_pose_set = false;
+
+    for (const pose_graph::VertexId &vertex_id : vertices_to_show) {
+        const vi_map::Vertex &vertex = map.getVertex(vertex_id);
+        CHECK_EQ(vertex.getMissionId(), mission_id)
+                << "All vertices should belong "
+                << "to the same mission with id " << mission_id.hexString();
+        const aslam::Transformation T_G_I = T_G_M * vertex.get_T_M_I();
+        const size_t color_index = rand() % visualization::kNumColors;
+
+        const size_t num_frames = vertex.numFrames();
+        // Process point cloud points
+        for (size_t frame_idx = 0u; frame_idx < num_frames; ++frame_idx) {
+          resources::PointCloud point_cloud;
+          if (!map.getFrameResource(
+              vertex, frame_idx, backend::ResourceType::kPointCloudXYZRGBN, &point_cloud)) {
+            continue;
+          }
+          const size_t point_cloud_size = point_cloud.size();
+          for (size_t point_idx = 0u; point_idx < point_cloud_size; ++point_idx) {
+            const double x = double(point_cloud.xyz[point_idx*3]);
+            const double y = double(point_cloud.xyz[point_idx*3+1]);
+            const double z = double(point_cloud.xyz[point_idx*3+2]);
+            Eigen::Vector3d point_C(x, y, z);
+            visualization::Sphere sphere;
+            sphere.radius = 0.03;
+            sphere.alpha = 0.8;
+            // Compute complete transformation.
+            const aslam::Transformation T_I_C =
+                n_camera.get_T_C_B(frame_idx).inverse();
+            const aslam::Transformation T_G_C = T_G_I * T_I_C;
+            sphere.position = T_G_C * point_C;
+            sphere.color = getPaletteColor(color_index, palette);
+            spheres->push_back(sphere);
+          }
+        }
+        // Process vertex pose
+        const Eigen::Vector3d M_p_I = vertex.get_p_M_I();
+        const Eigen::Quaterniond M_q_I = vertex.get_q_M_I();
+
+        visualization::Pose pose;
+        pose.G_p_B =
+            baseframe.transformPointInMissionFrameToGlobalFrame(M_p_I) - origin_;
+        pose.G_q_B = baseframe.transformRotationInMissionFrameToGlobalFrame(M_q_I);
+
+        pose.id = vertex_id.hashToSizeT();
+        pose.scale = 0.15;
+        pose.line_width = 0.01;
+        pose.alpha = 0.6;
+
+        poses.push_back(pose);
+
+        // Process vertex edge
+        if (last_pose_set) {
+          visualization::LineSegment line_segment;
+          line_segment.from = last_pose;
+          line_segment.to = pose.G_p_B;
+          line_segment.color.red = 50;
+          line_segment.color.green = 25;
+          line_segment.color.blue = 200;
+          line_segment.alpha = 1.0;
+          constexpr double kEdgeScalingFactor = 0.02;
+          line_segment.scale = FLAGS_vis_scale * kEdgeScalingFactor;
+          line_segments.push_back(line_segment);
+          LOG(INFO) << "Vertices distance = " << (line_segment.from - line_segment.to).norm();
+        }
+        last_pose = pose.G_p_B;
+        last_pose_set = true;
+    }
+    // Publish vertex pose and edge
+  const std::string &kNamespace = "vertices";
+  visualization::publishVerticesFromPoseVector(
+      poses, visualization::kDefaultMapFrame, kNamespace, visualization::kViMapTopicHead + "_depth_vertices");
+  if (!line_segments.empty()) {
+    unsigned int marker_id = mission_id.hashToSizeT();
+    visualization::publishLines(
+        line_segments, marker_id, visualization::kDefaultMapFrame,
+        visualization::kDefaultNamespace, "/vi_map_depth_edges/viwls");
+  }
+}
+
 void ViwlsGraphRvizPlotter::publishVertexPoseAsTF(
     const vi_map::VIMap& map, pose_graph::VertexId vertex_id) const {
   aslam::Transformation T_M_I = map.getVertex(vertex_id).get_T_M_I();
@@ -810,6 +991,9 @@ void ViwlsGraphRvizPlotter::visualizeMissions(
   }
 
   Aligned<std::vector, visualization::SphereVector> mission_spheres(
+          mission_ids.size());
+
+  Aligned<std::vector, visualization::SphereVector> depth_spheres(
       mission_ids.size());
 
   // For memory saving reasons we publish one mission at a time.
@@ -833,6 +1017,10 @@ void ViwlsGraphRvizPlotter::visualizeMissions(
             appendLandmarksToSphereVector(
                 map, {mission_id}, &mission_spheres[item]);
           }
+          if (FLAGS_vis_publish_depth_points) {
+            appendDepthPointsToSphereVector(
+                map, {mission_id}, &depth_spheres[item]);
+          }
         }
       };
 
@@ -845,10 +1033,20 @@ void ViwlsGraphRvizPlotter::visualizeMissions(
   for (const visualization::SphereVector& spheres : mission_spheres) {
     all_spheres.insert(all_spheres.end(), spheres.begin(), spheres.end());
   }
-  visualization::publishSpheresAsPointCloud(
-      all_spheres, visualization::kDefaultMapFrame, kLandmarkTopic);
-}
 
+  visualization::publishSpheresAsPointCloud(
+          all_spheres, visualization::kDefaultMapFrame, kLandmarkTopic);
+
+  if (FLAGS_vis_publish_depth_points) {
+    LOG(INFO) << "Start publishing depth points";
+    visualization::SphereVector all_depth_spheres;
+    for (const visualization::SphereVector &spheres : depth_spheres) {
+      all_depth_spheres.insert(all_depth_spheres.end(), spheres.begin(), spheres.end());
+    }
+    visualization::publishSpheresAsPointCloud(
+        all_depth_spheres, visualization::kDefaultMapFrame, kDepthPointsTopic);
+  }
+}
 void ViwlsGraphRvizPlotter::plotSlidingWindowLocalizationResult(
     const aslam::Transformation& T_G_B, size_t marker_id) const {
   visualization::SphereVector spheres;
